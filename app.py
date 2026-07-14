@@ -4,15 +4,15 @@ digest, and serve it locally with working Like/Dislike buttons.
 Usage: python app.py
 """
 
-import hashlib
 import html
 import json
 import os
 import time
 import webbrowser
-from datetime import datetime
+from datetime import date, datetime
 
 import claude_agent
+import db
 from sources import SOURCES
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,27 +37,39 @@ def taste_profile(prefs):
     return liked, disliked
 
 
-def stable_id(event):
-    key = f"{event.get('title', '').strip().lower()}|{event.get('venue', '').strip().lower()}|{event.get('date', '').strip().lower()}"
-    return hashlib.md5(key.encode()).hexdigest()[:12]
+def has_future_end_date(event):
+    end_date = (event.get("end_date") or "").strip()
+    try:
+        return date.fromisoformat(end_date) >= date.today()
+    except ValueError:
+        return False
 
 
 def fetch_all_candidates():
+    """Fetch every source. Returns (candidates, fetched_source_names) --
+    fetched_source_names only includes sources that didn't hard-fail, so
+    db.sync_candidates() knows which sources are safe to reconcile deletions
+    against."""
     candidates = []
-    seen_ids = set()
+    seen_fingerprints = set()
+    fetched_sources = []
     for source in SOURCES:
         print(f"Fetching {source['name']}...")
         events = claude_agent.extract_events(source)
+        if events is None:
+            print("  -> fetch failed, skipping (leaving its cached events untouched)")
+            continue
+        fetched_sources.append(source["name"])
         print(f"  -> {len(events)} events")
         for e in events:
-            if not e.get("title"):
+            if not e.get("title") or not has_future_end_date(e):
                 continue
-            e["id"] = stable_id(e)
-            if e["id"] in seen_ids:
+            fp = db.fingerprint(e.get("title", ""), e.get("venue", ""), e.get("date", ""))
+            if fp in seen_fingerprints:
                 continue
-            seen_ids.add(e["id"])
+            seen_fingerprints.add(fp)
             candidates.append(e)
-    return candidates
+    return candidates, fetched_sources
 
 
 def render_card(event, liked_ids, disliked_ids):
@@ -79,10 +91,11 @@ def render_card(event, liked_ids, disliked_ids):
     dislike_active = " active" if eid in disliked_ids else ""
 
     title_html = f'<a href="{url}" target="_blank" rel="noopener">{title}</a>' if url else title
+    new_badge = '<span class="new-badge">New</span>' if event.get("is_new") else ""
 
     return f"""
 <div class="card" data-title="{title}" data-category="{category}">
-  <h2>{title_html}</h2>
+  <h2>{title_html}{new_badge}</h2>
   <div class="meta">{meta}</div>
   <div><span class="tag">{category}</span><span class="tag">{source}</span></div>
   <div class="desc">{desc}</div>
@@ -124,20 +137,36 @@ def render_page(concerts, events, prefs):
 
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
+    conn = db.get_connection()
+
+    if db.is_dirty(conn):
+        print("DB is dirty from a previous run -- pruning expired events and clearing NEW flags...")
+        db.prune_and_clean(conn)
+
     prefs = load_preferences()
     liked, disliked = taste_profile(prefs)
 
-    candidates = fetch_all_candidates()
-    print(f"\n{len(candidates)} total candidates after dedupe.")
+    candidates, fetched_sources = fetch_all_candidates()
+    print(f"\n{len(candidates)} total candidates after dedupe (future events only).")
 
-    if candidates:
-        print("Classifying and ranking against your taste history...")
-        concert_ids, event_ids = claude_agent.curate_events(candidates, liked, disliked, cap=MAX_PER_TAB)
-        by_id = {c["id"]: c for c in candidates}
+    sync_stats = db.sync_candidates(conn, candidates, fetched_sources)
+    print(f"Synced to DB: {sync_stats['new']} new, {sync_stats['deleted']} removed, {sync_stats['touched']} touched.")
+
+    active_events = db.get_active_events(conn)
+    for e in active_events:
+        e["id"] = str(e["id"])  # curate_events/Claude deal in string ids
+
+    if active_events:
+        print(f"Classifying and ranking {len(active_events)} active events against your taste history...")
+        concert_ids, event_ids = claude_agent.curate_events(active_events, liked, disliked, cap=MAX_PER_TAB)
+        by_id = {e["id"]: e for e in active_events}
         concerts = [by_id[i] for i in concert_ids if i in by_id]
         events = [by_id[i] for i in event_ids if i in by_id]
+        db.update_buckets(conn, [int(i) for i in concert_ids], [int(i) for i in event_ids])
     else:
         concerts, events = [], []
+
+    conn.close()
 
     with open(EVENTS_LATEST_PATH, "w") as f:
         json.dump({"generated_at": time.time(), "concerts": concerts, "events": events}, f, indent=2)

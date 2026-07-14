@@ -19,6 +19,7 @@ EXTRACT_SCHEMA = {
                 "properties": {
                     "title": {"type": "string"},
                     "date": {"type": "string"},
+                    "end_date": {"type": "string"},
                     "time": {"type": "string"},
                     "venue": {"type": "string"},
                     "neighborhood": {"type": "string"},
@@ -70,20 +71,29 @@ def _run_claude(prompt, schema, timeout=120):
 
 
 def extract_events(source):
-    """Fetch a single source URL and extract upcoming events from it."""
+    """Fetch a single source URL and extract upcoming events from it.
+
+    Returns None on a hard failure (timeout/error/bad JSON) so callers can
+    tell "fetch failed" apart from "fetch succeeded, page had zero events" --
+    that distinction matters for safe deletion-reconciliation in db.py.
+    """
     prompt = (
         f"Fetch {source['url']} and extract EVERY event happening in the next 30 "
         "days that is visible on the page (concerts, meetups, classes, markets, "
         "exhibits, comedy shows, etc). Don't stop at a handful -- list as many as "
-        "the page actually shows, up to 50. For each event capture: title, date, "
-        "time, venue, neighborhood, category, a direct url if one is visible "
-        f"(otherwise use the source page url {source['url']}), and a "
-        "one-sentence description. Skip anything without a clear title. If you "
-        "can't find any events, return an empty events list rather than guessing."
+        "the page actually shows, up to 50. For each event capture: title, date "
+        "(display text, e.g. 'July 12, 13, 16 & 18, 2026'), end_date (the LAST "
+        "day the event occurs, as a strict ISO 8601 date YYYY-MM-DD -- for a "
+        "single-day event this equals that day; skip the event if you can't "
+        "confidently determine an end_date), time, venue, neighborhood, "
+        "category, a direct url if one is visible (otherwise use the source "
+        f"page url {source['url']}), and a one-sentence description. Skip "
+        "anything without a clear title. If you can't find any events, return "
+        "an empty events list rather than guessing."
     )
     result = _run_claude(prompt, EXTRACT_SCHEMA, timeout=180)
-    if not result:
-        return []
+    if result is None:
+        return None
     events = result.get("events", [])
     for e in events:
         e["source"] = source["name"]

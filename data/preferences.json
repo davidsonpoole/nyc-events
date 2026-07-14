@@ -1,0 +1,16 @@
+[
+  {
+    "id": "4fe80afb5bf2",
+    "title": "Ariana Grande",
+    "category": "Concert",
+    "action": "like",
+    "timestamp": 1783992111.721545
+  },
+  {
+    "id": "c9cd7512ca59",
+    "title": "Bon Jovi",
+    "category": "Rock",
+    "action": "dislike",
+    "timestamp": 1783992111.737101
+  }
+]
